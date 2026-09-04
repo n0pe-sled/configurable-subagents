@@ -1,0 +1,3 @@
+- insert:
+    - id: configurable-subagents
+      name: dsh-configurable-subagents
