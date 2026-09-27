@@ -3,9 +3,22 @@ import { apply } from '../lib/index.js'
 
 const listeners = new Map()
 const wrappers = new WeakMap()
-let stored = { provider: 'default-provider', model: 'default-model', reasoningEffort: 'high' }
+const sections = []
+let toolVisible = true
+let stored = {
+  provider: 'default-provider',
+  model: 'default-model',
+  reasoningEffort: 'high',
+  maxConcurrent: 4,
+  allowedModels: [],
+  singleLevel: true,
+}
 
 const listener = name => listeners.get(name)?.[0]
+
+function emit(name, payload) {
+  for (const callback of listeners.get(name) ?? []) callback(payload)
+}
 
 function wrapperFor(owner, name) {
   return wrappers.get(owner)?.get(name)
@@ -75,6 +88,23 @@ const originals = new Map([
   ['subagent_fork', originalTool('subagent_fork')],
 ])
 
+const promptCtx = {
+  systemPrompt: {
+    section(definition) {
+      sections.push(definition)
+      return () => {
+        const index = sections.indexOf(definition)
+        if (index >= 0) sections.splice(index, 1)
+      }
+    },
+  },
+  tools: {
+    get(name) {
+      return toolVisible && (name === 'subagent' || name === 'subagent_fork') ? originals.get(name) : undefined
+    },
+  },
+}
+
 const ctx = {
   settings: {
     register() {
@@ -92,12 +122,18 @@ const ctx = {
     listeners.set(name, values)
     return () => {}
   },
+  inject(names, callback) {
+    if (names.includes('systemPrompt')) callback(promptCtx)
+    return () => {}
+  },
 }
 
 apply(ctx)
 assert.equal(typeof listener('agent/created'), 'function')
 assert.equal(typeof listener('agent/session-start'), 'function')
 assert.equal(typeof listener('agent/request'), 'function')
+assert.equal(typeof listener('subagent/start'), 'function')
+assert.equal(typeof listener('subagent/end'), 'function')
 
 const root = agent('root')
 listener('agent/created')({ agent: root })
@@ -111,6 +147,23 @@ assert.equal(wrapper.parameters.properties.provider.type, 'string')
 assert.equal(wrapper.parameters.properties.model.type, 'string')
 assert.equal(wrapper.parameters.properties.reasoning_effort.type, 'string')
 
+// --- Tool-guidance section (orders 100-199) --------------------------------
+assert.equal(sections.length, 1)
+const section = sections[0]
+assert.equal(section.name, 'tool:subagent-routing')
+assert.ok(section.order >= 100 && section.order <= 199, 'the section belongs to the tool-guidance band')
+const guidance = section.text({})
+assert.match(guidance, /provider/)
+assert.match(guidance, /reasoning_effort/)
+assert.match(guidance, /default-provider\/default-model/)
+assert.match(guidance, /At most 4 sub-agents run at once/)
+assert.match(guidance, /Delegation is one level deep/)
+
+toolVisible = false
+assert.equal(section.text({}), '', 'guidance is omitted while no sub-agent tool is visible')
+toolVisible = true
+
+// --- Per-call routing ------------------------------------------------------
 const perCall = await wrapper.execute({
   description: 'route check',
   prompt: 'do work',
@@ -152,11 +205,11 @@ await assert.rejects(
   /provider and model must be supplied together/,
 )
 
-stored = { provider: '', model: '', reasoningEffort: '' }
+stored = { ...stored, provider: '', model: '', reasoningEffort: '' }
 const inherited = await wrapper.execute({ description: 'inherit', prompt: 'do work' }, {})
 assert.deepEqual(inherited.config, { provider: 'parent-provider', model: 'parent-model' })
 
-stored = { provider: 'new-default', model: 'new-model', reasoningEffort: 'max' }
+stored = { ...stored, provider: 'new-default', model: 'new-model', reasoningEffort: 'max' }
 const resumed = agent('resumed', { subagent: true })
 listener('agent/created')({ agent: resumed })
 listener('agent/session-start')({ agent: resumed, source: 'resume' })
@@ -169,5 +222,82 @@ assert.deepEqual(resumedConfig, {
   model: 'persisted-model',
   reasoningEffort: 'low',
 })
+
+// --- Model allowlist -------------------------------------------------------
+stored = {
+  provider: 'not-allowed',
+  model: 'not-allowed-model',
+  reasoningEffort: '',
+  maxConcurrent: 4,
+  allowedModels: [{ provider: 'allowed-a', model: 'model-a' }, { provider: 'allowed-b', model: 'model-b' }],
+  singleLevel: true,
+}
+const forced = await wrapper.execute({ description: 'forced', prompt: 'do work' }, {})
+assert.deepEqual(forced.config, { provider: 'allowed-a', model: 'model-a' })
+
+const allowedExplicit = await wrapper.execute({
+  description: 'allowed',
+  prompt: 'do work',
+  provider: 'allowed-b',
+  model: 'model-b',
+}, {})
+assert.deepEqual(allowedExplicit.config, { provider: 'allowed-b', model: 'model-b' })
+
+await assert.rejects(
+  wrapper.execute({
+    description: 'blocked',
+    prompt: 'do work',
+    provider: 'rogue',
+    model: 'rogue-model',
+  }, {}),
+  /not an allowed sub-agent model/,
+)
+
+stored = { ...stored, allowedModels: [] }
+const unrestricted = await wrapper.execute({
+  description: 'unrestricted',
+  prompt: 'do work',
+  provider: 'rogue',
+  model: 'rogue-model',
+}, {})
+assert.deepEqual(unrestricted.config, { provider: 'rogue', model: 'rogue-model' })
+
+// --- Concurrency cap -------------------------------------------------------
+stored = {
+  provider: '',
+  model: '',
+  reasoningEffort: '',
+  maxConcurrent: 2,
+  allowedModels: [],
+  singleLevel: true,
+}
+emit('subagent/start', { runId: 'run-1' })
+emit('subagent/start', { runId: 'run-2' })
+await assert.rejects(
+  wrapper.execute({ description: 'over cap', prompt: 'do work' }, {}),
+  /concurrency limit reached: 2 of 2/,
+)
+assert.match(section.text({}), /At most 2 sub-agents run at once/)
+emit('subagent/end', { runId: 'run-1' })
+const afterSettle = await wrapper.execute({ description: 'under cap', prompt: 'do work' }, {})
+assert.deepEqual(afterSettle.config, { provider: 'parent-provider', model: 'parent-model' })
+emit('subagent/end', { runId: 'run-2' })
+
+// --- One level deep --------------------------------------------------------
+stored = { ...stored, maxConcurrent: 4, singleLevel: true }
+const depthChild = agent('depth-child', { subagent: true })
+listener('agent/created')({ agent: depthChild })
+const childWrapper = wrapperFor(depthChild, 'subagent')
+assert.ok(childWrapper)
+await assert.rejects(
+  childWrapper.execute({ description: 'nested', prompt: 'do work' }, { agent: depthChild }),
+  /sub-agents may not delegate further/,
+)
+assert.match(section.text({}), /must not start its own children/)
+
+stored = { ...stored, singleLevel: false }
+const nested = await childWrapper.execute({ description: 'nested', prompt: 'do work' }, { agent: depthChild })
+assert.deepEqual(nested.config, { provider: 'parent-provider', model: 'parent-model' })
+assert.doesNotMatch(section.text({}), /must not start its own children/)
 
 console.log('configurable-subagents smoke test passed')
