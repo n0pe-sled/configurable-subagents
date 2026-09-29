@@ -11,7 +11,7 @@ It also adds **Settings > Sub-agents**, where you can save defaults for those fi
 ## Install
 
 ```bash
-dsh plugin --profile web add /path/to/deepseek-harness-plugins/configurable-subagents
+dsh plugin --profile web add /path/to/deepseek-harness/plugins/configurable-subagents
 ```
 
 Restart `dsh web` after installation. The host must load the node plugin and serve the new browser bundle.
